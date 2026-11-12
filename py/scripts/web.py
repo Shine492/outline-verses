@@ -10,9 +10,11 @@ from pathlib import PurePath
 
 from docx import Document
 
-from add_verses import ensure_style, format_document, insert_verses, plan_verses, render_report
+from add_verses import PDF_NOTE, ensure_style, format_document, insert_verses, plan_verses, render_report
 from bible import DATA, Bible
 from books import BOOKS
+from pdf_input import build_docx, paragraphs
+from pdf_layout import layout
 
 API = ("https://www.recoveryversion.com.tw/api/getVerses?VERSION=1"
        "&output[]=content&output[]=unit_code&output[]=segment_code"
@@ -76,37 +78,17 @@ async def _fetch(bible, book, chapter, sem, fetch_rows):
     raise RuntimeError(f"無法從恢復本網站取得 {BOOKS[book]['abbr']}{chapter}，請檢查網路後重試。")
 
 
-def build_docx(paras_json):
-    """PDF 讀出的段落（index.html 的 pdfToParagraphs）→ docx bytes，之後照一般綱要處理。
-    每段：{"text": 有編號的寫成「編號＜Tab＞文字」, "left"/"first": 縮排 twips（first 負值＝懸掛）, "size": pt}。"""
-    from docx.oxml.ns import qn
-    from docx.shared import Pt, Twips
-    doc = Document()
-    normal = doc.styles["Normal"]
-    normal.font.name = "Times New Roman"
-    normal.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), "標楷體")
-    normal.paragraph_format.space_after = Pt(0)
-    for p in json.loads(paras_json):
-        para = doc.add_paragraph()
-        para.paragraph_format.left_indent = Twips(p["left"])
-        para.paragraph_format.first_line_indent = Twips(p["first"])
-        head, tab, rest = p["text"].partition("\t")
-        para.add_run(head).font.size = Pt(p["size"])
-        if tab:
-            r = para.add_run()
-            r.add_tab()
-            r.add_text(rest)
-            r.font.size = Pt(p["size"])
-    out = BytesIO()
-    doc.save(out)
-    return out.getvalue()
+def pdf_to_docx(items_json):
+    """pdf.js 讀出的每頁文字片段（index.html 的 pdfItems）→ docx bytes，之後照一般綱要處理。"""
+    return build_docx(paragraphs(json.loads(items_json)))
 
 
 _bible = None
 
 
 async def run(data, filename, progress=None, fetch_rows=pyodide_fetch):
-    """綱要 docx（bytes）→ {"docx": 附經文的 docx bytes, "name", "report": 校對報告 md, "points", "verses"}。"""
+    """綱要 docx（bytes）→ {"docx": 附經文的 docx bytes, "name", "report": 校對報告 md,
+    "layout": 給網頁排 PDF 的版面 JSON, "points", "verses"}。"""
     global _bible
     if _bible is None:
         _bible = WebBible()          # 同一個分頁裏處理多份綱要時，已下載的章沿用
@@ -132,6 +114,9 @@ async def run(data, filename, progress=None, fetch_rows=pyodide_fetch):
     doc.save(out)
     src = PurePath(filename)
     name = f"{src.stem}（附經文）.docx"
+    if src.suffix.lower() == ".pdf":
+        report[PDF_NOTE].append("這份是從 PDF 讀出文字再重新排版的，請核對段落有沒有接錯、編號有沒有漏掉。")
     return {"docx": out.getvalue(), "name": name,
             "report": render_report(src, PurePath(name), stats, report),
+            "layout": json.dumps(layout(doc), ensure_ascii=False),
             "points": stats["points"], "verses": stats["verses"]}
