@@ -1,12 +1,13 @@
 """綱要附經文：在每一點綱要下面插入它引用的恢復本經文。
 
-用法：python3 scripts/add_verses.py <綱要.docx> [-o 輸出資料夾]
+用法：python3 scripts/add_verses.py <綱要.docx 或 .pdf> [-o 輸出資料夾]
 產出（預設放在 output/<原檔名>/）：<原檔名>（附經文）.docx、同名 .pdf、<原檔名>_校對報告.md；原檔不動。
 """
 import argparse
 import re
 import sys
 from collections import defaultdict
+from io import BytesIO
 from pathlib import Path
 
 from docx import Document
@@ -153,8 +154,18 @@ def _ind_value(ind, names, char_twips):
 
 
 def text_start_twips(p):
-    """綱要文字（編號後）第一個字的位置，給經文對齊用。
-    縮排的優先順序跟 Word 一樣：段落本身 > 自動編號那一層 > 段落樣式（含上層樣式）。"""
+    """綱要文字（編號後）第一個字的位置，給經文對齊用。"""
+    left, first = para_indent(p)
+    numbered = _num_pr(p) is not None
+    txt = para_text(p, skip_superscript=False)
+    if first < 0 and (numbered or "\t" in txt):
+        return max(left, 0)      # 懸掛縮排：編號（自動編號或打的編號＋Tab）在前，文字從 left 開始
+    return max(left + first, 0)  # 沒有編號（例：讀經）：對齊第一行起點
+
+
+def para_indent(p):
+    """段落實際的 (左縮排, 首行縮排) twips；首行縮排負值＝懸掛。
+    優先順序跟 Word 一樣：段落本身 > 自動編號那一層 > 段落樣式（含上層樣式）。"""
     ppr = p._p.pPr
     inds = [ppr.find(qn("w:ind")) if ppr is not None else None, _numbering_ind(p)]
     inds += [s.element.pPr.find(qn("w:ind")) if s.element.pPr is not None else None for s in _style_chain(p.style)]
@@ -170,11 +181,7 @@ def text_start_twips(p):
         if fl is not None:
             first = fl
             break
-    numbered = _num_pr(p) is not None
-    txt = para_text(p, skip_superscript=False)
-    if first < 0 and (numbered or "\t" in txt):
-        return max(left, 0)      # 懸掛縮排：編號（自動編號或打的編號＋Tab）在前，文字從 left 開始
-    return max(left + first, 0)  # 沒有編號（例：讀經）：對齊第一行起點
+    return left, first
 
 
 def ensure_style(doc):
@@ -519,11 +526,24 @@ def insert_verses(doc, plan):
             anchor = new
 
 
+PDF_NOTE = "PDF 讀出的文字（請核對）"
+
+
+def open_outline(src):
+    """綱要 → Document。PDF 先讀出文字、重新排成 Word（pdf_input.py），原本的字型和版面不保留。"""
+    if Path(src).suffix.lower() == ".pdf":
+        from pdf_input import pdf_to_docx
+        return Document(BytesIO(pdf_to_docx(src)))
+    return Document(src)
+
+
 def process(src, out_dir, pdf=True, hints=None):
     bible = Bible()
-    doc = Document(src)
+    doc = open_outline(src)
     ensure_style(doc)
     plan, report, stats = plan_verses(doc, bible, hints)
+    if src.suffix.lower() == ".pdf":
+        report[PDF_NOTE].append("這份是從 PDF 讀出文字再重新排版的，請核對段落有沒有接錯、編號有沒有漏掉。")
     format_document(doc)
     insert_verses(doc, plan)
 
@@ -538,7 +558,8 @@ def process(src, out_dir, pdf=True, hints=None):
 
 ORDER = ["無法解析的片段（請人工確認）", "查無經文", "沒有書卷、由上下文推斷的出處",
          "半節（請確認切分位置）", "句中出處：已附經文（請確認）", "句中出處：綱要已全文引用，略過",
-         "綱要已全文引用的經節（不列）", "句中提到整章（不列）", "整章引用（寫「從畧。」）", "六節以上的出處（寫「從畧。」）", "其他提醒"]
+         "綱要已全文引用的經節（不列）", "句中提到整章（不列）", "整章引用（寫「從畧。」）", "六節以上的出處（寫「從畧。」）", "其他提醒",
+         PDF_NOTE]
 
 
 def render_report(src, out_docx, stats, report):
@@ -557,7 +578,7 @@ def render_report(src, out_docx, stats, report):
 
 def main():
     ap = argparse.ArgumentParser(description="綱要附經文")
-    ap.add_argument("docx", type=Path)
+    ap.add_argument("docx", type=Path, help="綱要 .docx 或 .pdf")
     ap.add_argument("-o", "--out", type=Path, help="輸出資料夾（預設：output/<原檔名>/）")
     ap.add_argument("--no-pdf", action="store_true", help="不輸出 PDF")
     a = ap.parse_args()
