@@ -53,10 +53,10 @@
 
   <div class="card">
     <label id="drop" for="file">
-      <strong>選擇或拖曳綱要檔（.docx）</strong>
+      <strong>選擇或拖曳綱要檔（.docx 或 .pdf）</strong>
       <span>檔案只在你的瀏覽器裏處理，不會上傳</span>
     </label>
-    <input id="file" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+    <input id="file" type="file" accept=".docx,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/pdf">
     <p id="status">正在準備程式…</p>
   </div>
 
@@ -69,7 +69,8 @@
   <div class="card notes">
     <h2>說明</h2>
     <ul>
-      <li>只收 .docx。舊的 .doc 或 PDF，請先用 Word 開啟、另存成 .docx。</li>
+      <li>收 .docx 和 .pdf。PDF 會先讀出文字、重新排成 Word 檔再附經文，原本的字型和版面不會保留；有 Word 檔的話，用 Word 檔效果最好。掃描的圖片 PDF 讀不出文字。</li>
+      <li>舊的 .doc 請先用 Word 開啟、另存成 .docx。</li>
       <li>要 PDF：用 Word 開啟下載的檔案，再「另存新檔」成 PDF。</li>
       <li>第一次開啟要載入程式，約 10–30 秒；之後同一個分頁再處理就很快。</li>
       <li>規則：每一點列出它引用的每一節；一個出處達 6 節以上、或整章引用，寫「從畧。」；綱要已用引號引了大半節的，不再列。</li>
@@ -122,6 +123,115 @@ async function runOutline(buffer, filename) {
 }
 window.runOutline = runOutline;
 
+// ---------- PDF → 段落 ----------
+const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/";
+let pdfjsReady = null;
+function loadPdfjs() {
+  pdfjsReady ??= new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = PDFJS + "pdf.min.js";
+    s.onload = () => { pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.js"; resolve(pdfjsLib); };
+    s.onerror = () => reject(new Error("PDF 讀取程式載入失敗"));
+    document.head.appendChild(s);
+  });
+  return pdfjsReady;
+}
+
+// 綱要編號：壹、一、1、a、(1)…（後面跟著一段空白，才算編號）
+const MARKER_RE = /^(?:[壹貳叁參肆伍陸柒捌玖拾]+|[一二三四五六七八九十]+|\d{1,2}|[a-z]|[（(]\d{1,2}[)）])[、.．]?$/;
+const ASCII_RE = /[A-Za-z0-9]/;
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)] || 12; };
+
+// 一頁的文字 → 行：{x, right, size, chunks:[{x, right, str}]}（座標單位：pt）
+function pageLines(items) {
+  const parts = items.filter(it => it.str.trim()).map(it => ({
+    str: it.str, x: it.transform[4], y: it.transform[5], right: it.transform[4] + it.width,
+    h: Math.abs(it.transform[3]) || it.height }));
+  parts.sort((a, b) => b.y - a.y || a.x - b.x);
+  const lines = [];
+  for (const p of parts) {
+    const line = lines.find(l => Math.abs(l.y - p.y) < Math.max(l.h, p.h) * 0.5);
+    if (line) { line.parts.push(p); line.h = Math.max(line.h, p.h); }
+    else lines.push({ y: p.y, h: p.h, parts: [p] });
+  }
+  return lines.sort((a, b) => b.y - a.y).map(l => {
+    const big = Math.max(...l.parts.map(p => p.h));
+    const ps = l.parts.filter(p => p.h >= big * 0.7).sort((a, b) => a.x - b.x);   // 略過上標（註腳號碼）
+    const size = median(ps.map(p => p.h));
+    // 行首是編號、後面隔一段（Tab 留下的空白）才接文字 → 編號自成一塊
+    const marker = ps.length > 1 && MARKER_RE.test(ps[0].str.trim()) && ps[1].x - ps[0].right > size * 0.3;
+    const chunks = [];
+    for (const [i, p] of ps.entries()) {
+      const last = chunks[chunks.length - 1];
+      const gap = last ? p.x - last.right : 0;
+      if (last && gap < size * 0.8 && !(marker && i === 1)) {
+        const sp = gap > size * 0.2 && ASCII_RE.test(last.str.slice(-1)) && ASCII_RE.test(p.str[0]) ? " " : "";
+        last.str += sp + p.str;
+        last.right = Math.max(last.right, p.right);
+      } else chunks.push({ x: p.x, right: p.right, str: p.str });
+    }
+    chunks.forEach(c => { c.str = c.str.trim(); });
+    return { x: chunks[0].x, right: Math.max(...chunks.map(c => c.right)), size, chunks, marker };
+  });
+}
+
+// PDF → [{text, left, first, size}]：依行首位置和上一行有沒有寫滿，把行接回段落
+async function pdfToParagraphs(buffer) {
+  const pdfjs = await loadPdfjs();
+  const pdf = await pdfjs.getDocument({ data: buffer, cMapUrl: PDFJS + "cmaps/", cMapPacked: true }).promise;
+  const lines = [];
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const page = await pdf.getPage(n);
+    const ls = pageLines((await page.getTextContent()).items);
+    if (ls.length && /^[-–—\s]*\d+[-–—\s]*$/.test(ls[ls.length - 1].chunks.map(c => c.str).join(""))) ls.pop();  // 頁碼
+    lines.push(...ls);
+  }
+  if (!lines.length) throw new Error("這份 PDF 讀不出文字（可能是掃描的圖片），請改用 Word 檔。");
+  const margin = Math.min(...lines.map(l => l.x));
+  const rightEdge = Math.max(...lines.map(l => l.right));
+  const near = (a, b, size) => b != null && Math.abs(a - b) < size * 0.6;
+  const paras = [];
+  let cur = null;
+  for (const l of lines) {
+    const first = l.chunks[0].str;
+    const marker = l.marker || (l.chunks.length > 1 && MARKER_RE.test(first));
+    const body = (marker ? l.chunks.slice(1) : l.chunks).map(c => c.str).join(" ").replace(/(?<![A-Za-z0-9]) | (?![A-Za-z0-9])/g, "");
+    const short = l.right < rightEdge - l.size * 1.5;
+    // 接續上一段：懸掛縮排的第二行以後（行首對齊編號後的文字）一定是接續；
+    // 其他情形要上一行寫滿、行首對齊上一段
+    const hanging = cur && cur.textX != null && !near(cur.textX, cur.firstX, l.size);
+    if (cur && !marker && Math.abs(l.size - cur.size) < 1.5
+        && ((hanging && near(l.x, cur.textX, l.size))
+            || (!cur.ended && (near(l.x, cur.textX, l.size) || near(l.x, cur.firstX, l.size) || near(l.x, cur.contX, l.size))))) {
+      const sp = ASCII_RE.test(cur.text.slice(-1)) && ASCII_RE.test(body[0]) ? " " : "";
+      cur.text += sp + body;
+      cur.contX ??= l.x;
+      cur.ended = short;
+      continue;
+    }
+    cur = { firstX: l.x, textX: marker ? l.chunks[1].x : null, contX: null, size: l.size, ended: short,
+            text: marker ? `${first}\t${body}` : body };
+    paras.push(cur);
+  }
+  const tw = pt => Math.round((pt - margin) * 20);
+  return paras.map(p => {
+    const left = p.textX ?? p.contX ?? p.firstX;
+    return { text: p.text, left: tw(left), first: tw(p.firstX) - tw(left), size: Math.round(p.size * 2) / 2 };
+  });
+}
+window.pdfToParagraphs = pdfToParagraphs;
+
+// PDF → 重新排好的 docx bytes
+async function pdfToDocx(buffer) {
+  const web = await ready;
+  const paras = await pdfToParagraphs(buffer);
+  const bytes = web.build_docx(JSON.stringify(paras));
+  const arr = bytes.toJs();
+  bytes.destroy();
+  return arr;
+}
+window.pdfToDocx = pdfToDocx;
+
 function escapeHtml(s) {
   return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
@@ -146,15 +256,22 @@ function reportHtml(md) {
 
 async function handle(file) {
   if (!file || busy) return;
-  if (!/\.docx$/i.test(file.name)) {
-    setStatus("只收 .docx 檔。請先用 Word 開啟，另存成 .docx。", "err");
+  const isPdf = /\.pdf$/i.test(file.name);
+  if (!isPdf && !/\.docx$/i.test(file.name)) {
+    setStatus("只收 .docx 和 .pdf 檔。舊的 .doc 請先用 Word 開啟，另存成 .docx。", "err");
     return;
   }
   busy = true;
   document.getElementById("result").style.display = "none";
   try {
     setStatus("讀取綱要…");
-    const out = await runOutline(await file.arrayBuffer(), file.name);
+    let buffer = await file.arrayBuffer();
+    if (isPdf) {
+      setStatus("讀取 PDF 文字…");
+      buffer = (await pdfToDocx(buffer)).buffer;
+    }
+    const out = await runOutline(buffer, file.name);
+    if (isPdf) out.report += "\n## PDF 讀出的文字（請核對）\n\n- 這份是從 PDF 讀出文字再重新排版的，請核對段落有沒有接錯、編號有沒有漏掉。";
     const a = document.getElementById("download");
     if (a.href) URL.revokeObjectURL(a.href);
     a.href = URL.createObjectURL(out.blob);
