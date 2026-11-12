@@ -76,6 +76,32 @@ async def _fetch(bible, book, chapter, sem, fetch_rows):
     raise RuntimeError(f"無法從恢復本網站取得 {BOOKS[book]['abbr']}{chapter}，請檢查網路後重試。")
 
 
+def build_docx(paras_json):
+    """PDF 讀出的段落（index.html 的 pdfToParagraphs）→ docx bytes，之後照一般綱要處理。
+    每段：{"text": 有編號的寫成「編號＜Tab＞文字」, "left"/"first": 縮排 twips（first 負值＝懸掛）, "size": pt}。"""
+    from docx.oxml.ns import qn
+    from docx.shared import Pt, Twips
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), "標楷體")
+    normal.paragraph_format.space_after = Pt(0)
+    for p in json.loads(paras_json):
+        para = doc.add_paragraph()
+        para.paragraph_format.left_indent = Twips(p["left"])
+        para.paragraph_format.first_line_indent = Twips(p["first"])
+        head, tab, rest = p["text"].partition("\t")
+        para.add_run(head).font.size = Pt(p["size"])
+        if tab:
+            r = para.add_run()
+            r.add_tab()
+            r.add_text(rest)
+            r.font.size = Pt(p["size"])
+    out = BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
 _bible = None
 
 
