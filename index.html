@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>綱要附經文</title>
+<meta name="description" content="上傳綱要 Word 檔，自動在每一點下面附上中文恢復本經文。">
+<style>
+  :root {
+    --bg: #faf7f2; --card: #ffffff; --text: #2b2622; --muted: #6f655c; --line: #e4dcd2;
+    --accent: #8a3324; --accent-soft: #f6e9e5; --ok: #2e6b4f; --err: #a1261b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1c1a18; --card: #26231f; --text: #ece6df; --muted: #a89e93; --line: #3a352f;
+      --accent: #e08d78; --accent-soft: #3a2a25; --ok: #7cc4a0; --err: #f08a7e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.7 "Noto Sans TC", "Microsoft JhengHei", "PingFang TC", sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: .05em; }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+  #drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 36px 16px; text-align: center;
+          cursor: pointer; transition: border-color .15s, background .15s; }
+  #drop:hover, #drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  #drop strong { display: block; font-size: 18px; margin-bottom: 4px; }
+  #drop span { color: var(--muted); font-size: 14px; }
+  #file { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  #status { margin: 16px 0 0; min-height: 1.7em; color: var(--muted); }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+  .btn { display: inline-block; background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+         padding: 10px 20px; font: inherit; text-decoration: none; cursor: pointer; }
+  .btn:hover { filter: brightness(1.08); }
+  #result { display: none; }
+  #result h2 { font-size: 18px; margin: 0 0 12px; }
+  #report { margin-top: 16px; font-size: 14px; border-top: 1px solid var(--line); padding-top: 8px; overflow-wrap: anywhere; }
+  #report h4 { font-size: 15px; margin: 14px 0 4px; color: var(--accent); }
+  #report ul { margin: 0; padding-left: 20px; }
+  .notes { font-size: 14px; color: var(--muted); }
+  .notes h2 { font-size: 15px; color: var(--text); margin: 0 0 6px; }
+  .notes ul { margin: 0; padding-left: 20px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>綱要附經文</h1>
+  <p class="lead">上傳綱要 Word 檔，自動在每一點下面附上中文恢復本經文，並列出需要人工確認的地方。</p>
+
+  <div class="card">
+    <label id="drop" for="file">
+      <strong>選擇或拖曳綱要檔（.docx）</strong>
+      <span>檔案只在你的瀏覽器裏處理，不會上傳</span>
+    </label>
+    <input id="file" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+    <p id="status">正在準備程式…</p>
+  </div>
+
+  <div class="card" id="result">
+    <h2 id="result-title"></h2>
+    <a class="btn" id="download">下載附經文的 Word 檔</a>
+    <div id="report"></div>
+  </div>
+
+  <div class="card notes">
+    <h2>說明</h2>
+    <ul>
+      <li>只收 .docx。舊的 .doc 或 PDF，請先用 Word 開啟、另存成 .docx。</li>
+      <li>要 PDF：用 Word 開啟下載的檔案，再「另存新檔」成 PDF。</li>
+      <li>第一次開啟要載入程式，約 10–30 秒；之後同一個分頁再處理就很快。</li>
+      <li>規則：每一點列出它引用的每一節；一個出處達 6 節以上、或整章引用，寫「從畧。」；綱要已用引號引了大半節的，不再列。</li>
+      <li>經文由你的瀏覽器直接向<a href="https://www.recoveryversion.com.tw" target="_blank" rel="noopener">恢復本網站</a>取得，本網站不存放經文。恢復本經文有版權，請只供個人查考與服事使用。</li>
+    </ul>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const VERSION = "1";
+const PY_FILES = ["scripts/books.py", "scripts/refparse.py", "scripts/bible.py", "scripts/export_pdf.py",
+                  "scripts/add_verses.py", "scripts/web.py", "data/variants.json"];
+const ROOT = "/home/pyodide/ov";
+const statusEl = document.getElementById("status");
+let busy = false;
+
+function setStatus(text, kind) {
+  statusEl.textContent = text;
+  statusEl.className = kind || "";
+}
+
+async function boot() {
+  const py = await loadPyodide();
+  await py.loadPackage(["micropip", "lxml"]);
+  await py.pyimport("micropip").install("python-docx==1.1.2");
+  for (const f of PY_FILES) {
+    const r = await fetch(`py/${f}?v=${VERSION}`);
+    if (!r.ok) throw new Error(`讀不到 ${f}`);
+    const path = `${ROOT}/${f}`;
+    py.FS.mkdirTree(path.slice(0, path.lastIndexOf("/")));
+    py.FS.writeFile(path, new Uint8Array(await r.arrayBuffer()));
+  }
+  py.runPython(`import sys; sys.path.insert(0, "${ROOT}/scripts")`);
+  return py.pyimport("web");
+}
+
+const ready = boot().then(
+  web => { setStatus("準備好了，請選擇綱要檔。"); return web; },
+  err => { setStatus("程式載入失敗，請重新整理頁面再試。（" + err.message + "）", "err"); throw err; });
+
+// 綱要 docx → {blob, name, report, points, verses}；也給測試直接呼叫
+async function runOutline(buffer, filename) {
+  const web = await ready;
+  const res = await web.run(new Uint8Array(buffer), filename, msg => setStatus(msg));
+  const out = res.toJs({ dict_converter: Object.fromEntries });
+  res.destroy();
+  return { ...out, blob: new Blob([out.docx], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }) };
+}
+window.runOutline = runOutline;
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// 校對報告（Markdown）→ 簡單 HTML：只用到 #、##、- 三種
+function reportHtml(md) {
+  let html = "", inList = false;
+  for (const raw of md.split("\n")) {
+    const line = escapeHtml(raw.replace(/`/g, ""));
+    if (line.startsWith("- ")) {
+      if (!inList) { html += "<ul>"; inList = true; }
+      html += `<li>${line.slice(2)}</li>`;
+      continue;
+    }
+    if (inList) { html += "</ul>"; inList = false; }
+    if (line.startsWith("## ")) html += `<h4>${line.slice(3)}</h4>`;
+    else if (line.startsWith("# ") || !line.trim()) continue;
+    else html += `<p>${line}</p>`;
+  }
+  return html + (inList ? "</ul>" : "");
+}
+
+async function handle(file) {
+  if (!file || busy) return;
+  if (!/\.docx$/i.test(file.name)) {
+    setStatus("只收 .docx 檔。請先用 Word 開啟，另存成 .docx。", "err");
+    return;
+  }
+  busy = true;
+  document.getElementById("result").style.display = "none";
+  try {
+    setStatus("讀取綱要…");
+    const out = await runOutline(await file.arrayBuffer(), file.name);
+    const a = document.getElementById("download");
+    if (a.href) URL.revokeObjectURL(a.href);
+    a.href = URL.createObjectURL(out.blob);
+    a.download = out.name;
+    document.getElementById("result-title").textContent =
+      `完成：${out.points} 段綱要、${out.verses} 節經文`;
+    document.getElementById("report").innerHTML = reportHtml(out.report);
+    document.getElementById("result").style.display = "block";
+    setStatus("完成。請下載，並看下面的校對項目。", "ok");
+  } catch (err) {
+    console.error(err);
+    setStatus("處理失敗：" + (err.message || err).toString().split("\n").filter(Boolean).pop(), "err");
+  } finally {
+    busy = false;
+    document.getElementById("file").value = "";
+  }
+}
+
+const drop = document.getElementById("drop");
+document.getElementById("file").addEventListener("change", e => handle(e.target.files[0]));
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });
+</script>
+</body>
+</html>
